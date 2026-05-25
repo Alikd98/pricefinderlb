@@ -409,9 +409,9 @@ footer{margin-top:48px;border-top:1px solid rgba(255,255,255,.07);padding-top:36
 const SERP_KEY = "f6209b4992dfe1f7d8285cec72779d7480a3b74eed41664f4f8bdfdd2b9403cb";
 const USD_LBP  = 89500;
 
-const GL = {lb:"lb",ae:"ae",sa:"sa",kw:"kw",qa:"qa",eg:"eg",jo:"jo",tr:"tr",gb:"gb",us:"us",de:"de",fr:"fr",ca:"ca",cn:"cn",jp:"jp",in:"in",int:"us"};
-const SUFFIX = {lb:"Lebanon",ae:"UAE",sa:"Saudi Arabia",kw:"Kuwait",qa:"Qatar",eg:"Egypt",jo:"Jordan",tr:"Turkey",gb:"UK",us:"USA",de:"Germany",fr:"France",ca:"Canada",cn:"China",jp:"Japan",in:"India",int:""};
-const CMETA = {
+const GL     = {lb:"lb",ae:"ae",sa:"sa",kw:"kw",qa:"qa",eg:"eg",jo:"jo",tr:"tr",gb:"gb",us:"us",de:"de",fr:"fr",ca:"ca",cn:"cn",jp:"jp",in:"in",int:"us"};
+const SUFFIX  = {lb:"Lebanon",ae:"UAE",sa:"Saudi Arabia",kw:"Kuwait",qa:"Qatar",eg:"Egypt",jo:"Jordan",tr:"Turkey",gb:"UK",us:"USA",de:"Germany",fr:"France",ca:"Canada",cn:"China",jp:"Japan",in:"India",int:""};
+const CMETA   = {
   lb:{tag:"🇱🇧 Lebanon Price Comparison",lbl:"Search any product sold in Lebanon"},
   ae:{tag:"🇦🇪 UAE Price Comparison",lbl:"Search any product sold in UAE"},
   sa:{tag:"🇸🇦 Saudi Arabia Prices",lbl:"Search any product in Saudi Arabia"},
@@ -471,21 +471,43 @@ function fmt(v){
   return"$"+v.toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:2});
 }
 
+// ── PROXY FETCH ───────────────────────────────────────────────────────────────
+// 4 different proxies — tries all in parallel, takes first that works
+async function proxyFetch(url) {
+  const proxies = [
+    `https://corsproxy.io/?${encodeURIComponent(url)}`,
+    `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`,
+    `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`,
+    `https://thingproxy.freeboard.io/fetch/${url}`,
+  ];
+
+  // Race all proxies — first to respond wins
+  const results = await Promise.any(
+    proxies.map(async proxyUrl => {
+      const res = await fetch(proxyUrl, { signal: AbortSignal.timeout(8000) });
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      const text = await res.text();
+      if (!text || text.length < 10) throw new Error("Empty response");
+      // allorigins wraps result in {contents:"..."}
+      if (text.trimStart().startsWith('{"contents"')) {
+        const w = JSON.parse(text);
+        return JSON.parse(w.contents);
+      }
+      return JSON.parse(text);
+    })
+  );
+  return results;
+}
+
+async function serpSearch(params) {
+  const url = "https://serpapi.com/search.json?" + new URLSearchParams({...params, api_key: SERP_KEY});
+  return proxyFetch(url);
+}
+
 // ── SEARCH ────────────────────────────────────────────────────────────────────
 function quick(q){document.getElementById("query").value=q;go();}
 function go(){const q=document.getElementById("query").value.trim();if(q)doSearch(q);}
 document.getElementById("query").addEventListener("keydown",e=>{if(e.key==="Enter")go();});
-
-async function serpCall(params) {
-  // Direct SerpAPI call — corsproxy.io handles CORS, very fast
-  const serpUrl = "https://serpapi.com/search.json?" + new URLSearchParams({...params, api_key: SERP_KEY}).toString();
-  const res = await fetch("https://corsproxy.io/?" + encodeURIComponent(serpUrl), {
-    signal: AbortSignal.timeout(8000) // 8 second timeout
-  });
-  if (!res.ok) throw new Error("Proxy error " + res.status);
-  const text = await res.text();
-  return JSON.parse(text);
-}
 
 async function doSearch(q){
   startLoad(q);
@@ -496,97 +518,168 @@ async function doSearch(q){
 
   const gl     = GL[selC] || "lb";
   const suffix = SUFFIX[selC] !== undefined ? SUFFIX[selC] : "Lebanon";
-  const q1 = suffix ? `${q} ${suffix} price buy` : `${q} price buy`;
-  const q2 = suffix ? `${q} ${suffix}` : q;
+  // Build multiple search queries for better coverage
+  const searchQ  = suffix ? `${q} ${suffix} price buy` : `${q} price buy`;
+  const shoppingQ = suffix ? `${q} ${suffix}` : q;
 
   try {
-    // Single fast call — shopping results have prices, images, store names
-    let shopping = [], organic = [], fallback = "";
-    
-    // Try shopping first (fastest, most structured)
-    try {
-      const shopData = await serpCall({ engine:"google_shopping", q:q2, gl, hl:"en", num:"10" });
-      shopping = shopData.shopping_results || [];
-    } catch(e) { console.warn("shopping failed:", e.message); }
+    // Run shopping + organic searches in parallel
+    const [shopRes, orgRes] = await Promise.allSettled([
+      serpSearch({ engine:"google_shopping", q:shoppingQ, gl, hl:"en", num:"20" }),
+      serpSearch({ engine:"google", q:searchQ, gl, hl:"en", num:"10" }),
+    ]);
 
-    // If shopping gave nothing, try organic
-    if (shopping.length === 0) {
+    let shopping = [];
+    let organic  = [];
+    let fallback = "";
+
+    if (shopRes.status === "fulfilled" && shopRes.value) {
+      shopping = shopRes.value.shopping_results || [];
+    }
+    if (orgRes.status === "fulfilled" && orgRes.value) {
+      organic = orgRes.value.organic_results || [];
+      // Also grab any inline shopping from organic results page
+      const inlineShop = orgRes.value.shopping_results || [];
+      for (const s of inlineShop) shopping.push(s);
+      for (const o of organic) { if (o.thumbnail) { fallback = o.thumbnail; break; } }
+    }
+
+    const seen = new Set();
+
+    // Process shopping results (most reliable — have real prices)
+    for (const s of shopping) {
       try {
-        const orgData = await serpCall({ engine:"google", q:q1, gl, hl:"en", num:"10" });
-        organic  = orgData.organic_results  || [];
-        shopping = orgData.shopping_results || [];
-        for(const o of organic){if(o.thumbnail){fallback=o.thumbnail;break;}}
-      } catch(e) { console.warn("organic failed:", e.message); }
-    }
-
-    const seen=new Set();
-
-    for(const s of shopping){
-      try{
-        const name=(s.source||s.seller||dom(s.link)||"").trim();
-        if(!name||name.length<2)continue;
-        const price=shopPrice(s.extracted_price,s.price);
-        if(!price)continue;
-        const k=slug(name);if(seen.has(k))continue;seen.add(k);
-        const qty=getQty(s.title||"");
-        stores.push({store:name,url:s.link||s.product_link||"",total_price_usd:f2(price),quantity:qty,price_per_unit_usd:f4(price/qty),type:"online",location:suffix||"International",notes:(s.title||"").slice(0,120),image:s.thumbnail||s.image||fallback});
-      }catch(_){}
-    }
-
-    for(const o of organic){
-      try{
-        const name=dom(o.displayed_link||o.link||"");
-        if(!name||name.length<2)continue;
-        const k=slug(name);if(seen.has(k))continue;
-        const text=(o.snippet||"")+" "+(o.title||"");
-        const price=orgPrice(text);if(!price)continue;
+        const name = (s.source || s.seller || dom(s.link || s.product_link || "") || "").trim();
+        if (!name || name.length < 2) continue;
+        const price = shopPrice(s.extracted_price, s.price || s.old_price || "");
+        if (!price || price <= 0) continue;
+        const k = slug(name);
+        if (seen.has(k)) continue;
         seen.add(k);
-        const qty=getQty(text);
-        stores.push({store:name,url:o.link||"",total_price_usd:f2(price),quantity:qty,price_per_unit_usd:f4(price/qty),type:"online",location:suffix||"International",notes:(o.snippet||"").slice(0,120),image:o.thumbnail||fallback});
-      }catch(_){}
+        const qty = getQty(s.title || "");
+        stores.push({
+          store: name,
+          url: s.link || s.product_link || "",
+          total_price_usd: f2(price),
+          quantity: qty,
+          price_per_unit_usd: f4(price / qty),
+          type: "online",
+          location: suffix || "International",
+          notes: (s.title || "").slice(0, 120),
+          image: s.thumbnail || s.image || fallback,
+        });
+      } catch(_) {}
     }
 
-    stores.sort((a,b)=>a.price_per_unit_usd-b.price_per_unit_usd);
+    // Process organic results (fallback — extract prices from snippets)
+    for (const o of organic) {
+      try {
+        const name = dom(o.displayed_link || o.link || "");
+        if (!name || name.length < 2) continue;
+        const k = slug(name);
+        if (seen.has(k)) continue;
+        const text = (o.snippet || "") + " " + (o.title || "");
+        const price = orgPrice(text);
+        if (!price || price <= 0) continue;
+        seen.add(k);
+        const qty = getQty(text);
+        stores.push({
+          store: name,
+          url: o.link || "",
+          total_price_usd: f2(price),
+          quantity: qty,
+          price_per_unit_usd: f4(price / qty),
+          type: "online",
+          location: suffix || "International",
+          notes: (o.snippet || "").slice(0, 120),
+          image: o.thumbnail || fallback,
+        });
+      } catch(_) {}
+    }
+
+    stores.sort((a, b) => a.price_per_unit_usd - b.price_per_unit_usd);
     stopLoad();
 
-    if(!stores.length){
-      document.getElementById("res-zone").innerHTML=`<div class="no-res"><div style="font-size:36px;margin-bottom:14px">🔎</div><div class="no-res-title">No Results Found</div><div class="no-res-sub">Try a different keyword or switch country.<br>Example: <em>"PS5 Lebanon"</em></div></div>`;
+    if (!stores.length) {
+      document.getElementById("res-zone").innerHTML = `
+        <div class="no-res">
+          <div style="font-size:36px;margin-bottom:14px">🔎</div>
+          <div class="no-res-title">No Results Found</div>
+          <div class="no-res-sub">
+            Try being more specific.<br>
+            Example: <em>"Mifare Classic 1K cards Lebanon"</em><br>
+            or switch to <em>International</em> search.
+          </div>
+        </div>`;
       return;
     }
-    renderSum();renderFilters();renderCards(filtered());
+    renderSum(); renderFilters(); renderCards(filtered());
 
-  }catch(e){
-    console.error(e);stopLoad();
-    document.getElementById("err-zone").innerHTML=`<div class="err-box"><span style="font-size:20px;flex-shrink:0">⚠️</span><div><div class="err-title">Search Failed</div>${e.message}</div></div>`;
-    document.getElementById("res-zone").innerHTML=`<div class="empty"><span class="e-icon">😕</span><div class="e-title">Error</div><div class="e-sub">Please try again in a moment.</div></div>`;
+  } catch(e) {
+    console.error(e); stopLoad();
+    document.getElementById("err-zone").innerHTML = `
+      <div class="err-box">
+        <span style="font-size:20px;flex-shrink:0">⚠️</span>
+        <div><div class="err-title">Search Failed</div>${e.message}</div>
+      </div>`;
+    document.getElementById("res-zone").innerHTML = `
+      <div class="empty"><span class="e-icon">😕</span>
+      <div class="e-title">Error</div>
+      <div class="e-sub">Please try again in a moment.</div></div>`;
   }
 }
 
-// ── HELPERS ───────────────────────────────────────────────────────────────────
-function shopPrice(extracted,display){
-  if(typeof extracted==="number"&&extracted>=0.5){return extracted>500000?f4(extracted/USD_LBP):extracted;}
-  if(display){const s=String(display).replace(/,(?=\d{3})/g,"");const m=s.match(/\$\s*([0-9]+(?:\.[0-9]{1,2})?)/);if(m){const v=parseFloat(m[1]);if(v>=0.1&&v<=100000)return v;}}
+// ── PRICE HELPERS ─────────────────────────────────────────────────────────────
+function shopPrice(extracted, display) {
+  if (typeof extracted === "number" && extracted >= 0.5) {
+    return extracted > 500000 ? f4(extracted / USD_LBP) : extracted;
+  }
+  if (display) {
+    const s = String(display).replace(/,(?=\d{3})/g, "");
+    const m = s.match(/\$\s*([0-9]+(?:\.[0-9]{1,2})?)/);
+    if (m) { const v = parseFloat(m[1]); if (v >= 0.1 && v <= 100000) return v; }
+    const lbp = s.match(/([0-9,]+)\s*(?:LBP|ل\.ل)/i);
+    if (lbp) { const v = parseFloat(lbp[1].replace(/,/g,"")); if (v >= 1000) return f4(v/USD_LBP); }
+  }
   return null;
 }
-function orgPrice(text){
-  if(!text)return null;
-  for(const p of[/\$\s*([1-9][0-9,]*(?:\.[0-9]{1,2})?)/,/USD\s*([1-9][0-9,]*(?:\.[0-9]{1,2})?)/i]){const m=text.match(p);if(m){const v=parseFloat(m[1].replace(/,/g,""));if(v>=0.1&&v<=100000)return v;}}
-  const lbp=text.match(/([1-9][0-9,\s]*)\s*(?:LBP|ل\.ل)/i);if(lbp){const v=parseFloat(lbp[1].replace(/[,\s]/g,""));if(v>=1000)return f4(v/USD_LBP);}
+
+function orgPrice(text) {
+  if (!text) return null;
+  for (const p of [/\$\s*([1-9][0-9,]*(?:\.[0-9]{1,2})?)/, /USD\s*([1-9][0-9,]*(?:\.[0-9]{1,2})?)/i]) {
+    const m = text.match(p);
+    if (m) { const v = parseFloat(m[1].replace(/,/g,"")); if (v >= 0.1 && v <= 100000) return v; }
+  }
+  const lbp = text.match(/([1-9][0-9,\s]*)\s*(?:LBP|ل\.ل)/i);
+  if (lbp) { const v = parseFloat(lbp[1].replace(/[,\s]/g,"")); if (v >= 1000) return f4(v/USD_LBP); }
   return null;
 }
-function getQty(text){const m=(text||"").match(/(?:pack\s+of|box\s+of|lot\s+of|qty\s*:?\s*)([0-9]+)|([0-9]+)\s*(?:pcs?|pieces?|cards?|rolls?|sheets?|units?)\b/i);if(m){const n=parseInt(m[1]||m[2]);if(n>1&&n<=100000)return n;}return 1;}
-function dom(url){try{const h=url.replace(/^https?:\/\//i,"").split("/")[0].replace(/^www\./i,"");const n=h.split(".")[0];return n&&n.length>1?n.replace(/[-_]/g," ").replace(/\b\w/g,c=>c.toUpperCase()):"";}catch{return "";}}
-function slug(s){return s.toLowerCase().replace(/\s+/g,"").slice(0,24);}
-function f2(v){return Math.round(v*100)/100;}
-function f4(v){return Math.round(v*10000)/10000;}
-function filtered(){return filt==="all"?stores:stores.filter(s=>s.type===filt);}
+
+function getQty(text) {
+  const m = (text||"").match(/(?:pack\s+of|box\s+of|lot\s+of|qty\s*:?\s*)([0-9]+)|([0-9]+)\s*(?:pcs?|pieces?|cards?|rolls?|sheets?|units?)/i);
+  if (m) { const n = parseInt(m[1]||m[2]); if (n>1&&n<=100000) return n; }
+  return 1;
+}
+
+function dom(url) {
+  try {
+    const h = url.replace(/^https?:\/\//i,"").split("/")[0].replace(/^www\./i,"");
+    const n = h.split(".")[0];
+    return n&&n.length>1?n.replace(/[-_]/g," ").replace(/\w/g,c=>c.toUpperCase()):"";
+  } catch { return ""; }
+}
+
+function slug(s) { return s.toLowerCase().replace(/\s+/g,"").slice(0,24); }
+function f2(v)   { return Math.round(v*100)/100; }
+function f4(v)   { return Math.round(v*10000)/10000; }
+function filtered() { return filt==="all"?stores:stores.filter(s=>s.type===filt); }
 
 // ── RENDER ────────────────────────────────────────────────────────────────────
-function renderSum(){
-  if(!stores.length){document.getElementById("sum-zone").innerHTML="";return;}
-  const best=stores[0],worst=stores[stores.length-1];
-  const sav=worst.price_per_unit_usd>0?((1-best.price_per_unit_usd/worst.price_per_unit_usd)*100).toFixed(0)+"%":"—";
-  const on=stores.filter(s=>s.type==="online").length,ins=stores.filter(s=>s.type==="in-store").length;
+function renderSum() {
+  if (!stores.length) { document.getElementById("sum-zone").innerHTML=""; return; }
+  const best=stores[0], worst=stores[stores.length-1];
+  const sav = worst.price_per_unit_usd>0 ? ((1-best.price_per_unit_usd/worst.price_per_unit_usd)*100).toFixed(0)+"%" : "—";
+  const on=stores.filter(s=>s.type==="online").length, ins=stores.filter(s=>s.type==="in-store").length;
   const m=CMETA[selC]||CMETA.lb;
   document.getElementById("sum-zone").innerHTML=`
     <div class="div-line"><div class="div-txt">${m.tag}</div></div>
@@ -596,50 +689,76 @@ function renderSum(){
       <div class="sc" style="animation-delay:.16s"><div class="sc-lbl">Max savings</div><div class="sc-val gold">${sav}</div><div class="sc-sub">best vs worst deal</div></div>
     </div>`;
 }
-function renderFilters(){
-  const on=stores.some(s=>s.type==="online"),ins=stores.some(s=>s.type==="in-store");
-  document.getElementById("fil-zone").innerHTML=`<div class="fil-row"><button class="f-btn on" data-f="all" onclick="setF('all')">All stores</button>${on?'<button class="f-btn" data-f="online" onclick="setF(\'online\')">🌐 Online</button>':''}${ins?'<button class="f-btn" data-f="in-store" onclick="setF(\'in-store\')">📍 In-store</button>':''}</div>`;
+
+function renderFilters() {
+  const on=stores.some(s=>s.type==="online"), ins=stores.some(s=>s.type==="in-store");
+  document.getElementById("fil-zone").innerHTML=`
+    <div class="fil-row">
+      <button class="f-btn on" data-f="all" onclick="setF('all')">All stores</button>
+      ${on?'<button class="f-btn" data-f="online" onclick="setF('online')">🌐 Online</button>':''}
+      ${ins?'<button class="f-btn" data-f="in-store" onclick="setF('in-store')">📍 In-store</button>':''}
+    </div>`;
 }
-function setF(f){filt=f;document.querySelectorAll(".f-btn").forEach(b=>b.classList.toggle("on",b.dataset.f===f));renderCards(filtered());}
-function renderCards(list){
+
+function setF(f) {
+  filt=f;
+  document.querySelectorAll(".f-btn").forEach(b=>b.classList.toggle("on",b.dataset.f===f));
+  renderCards(filtered());
+}
+
+function renderCards(list) {
   const area=document.getElementById("res-zone");
-  if(!list.length){area.innerHTML='<div class="empty"><span class="e-icon">😕</span><div class="e-title">No Match</div></div>';return;}
+  if (!list.length) { area.innerHTML='<div class="empty"><span class="e-icon">😕</span><div class="e-title">No Match</div></div>'; return; }
   const gb=stores[0];
   const html=list.map(s=>{
-    const iB=s===gb,idx=stores.indexOf(s);
+    const iB=s===gb, idx=stores.indexOf(s);
     const over=!iB&&gb.price_per_unit_usd>0?((s.price_per_unit_usd/gb.price_per_unit_usd-1)*100).toFixed(0):null;
     const rB=iB?'<div class="rank-badge top">🏆</div>':`<div class="rank-badge">${idx+1}</div>`;
-    const img=s.image?`<img class="card-img" src="${s.image}" alt="${s.store}" loading="lazy" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">`:""
+    const img=s.image?`<img class="card-img" src="${s.image}" alt="${s.store}" loading="lazy" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'">` :"";
     const ph=`<div class="card-img-ph" style="${s.image?"display:none":""}">📦</div>`;
     const tb=s.type==="online"?'<span class="bdg bdg-online">Online</span>':'<span class="bdg bdg-store">In-store</span>';
-    const bb=iB?'<span class="bdg bdg-best">Best deal</span>':""
-    const loc=s.location?`<span class="sep">·</span><span class="mt">📍 ${s.location}</span>`:""
+    const bb=iB?'<span class="bdg bdg-best">Best deal</span>':"";
+    const loc=s.location?`<span class="sep">·</span><span class="mt">📍 ${s.location}</span>`:"";
     const qty=`<span class="sep">·</span><span class="mt">${s.quantity} pc${s.quantity!==1?"s":""}</span>`;
     const tot=`<span class="sep">·</span><span class="mt">${fmt(s.total_price_usd)} total</span>`;
-    const lnk=s.url&&s.url.startsWith("http")?`<a class="visit-btn" href="${s.url}" target="_blank" rel="noopener"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>Visit store</a>`:""
-    const pt=iB?'<div class="best-tag">✓ Best</div>':over?`<div class="over-tag">+${over}%</div>`:""
+    const lnk=s.url&&s.url.startsWith("http")?`<a class="visit-btn" href="${s.url}" target="_blank" rel="noopener"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>Visit store</a>`:"";
+    const pt=iB?'<div class="best-tag">✓ Best</div>':over?`<div class="over-tag">+${over}%</div>`:"";
     return `<div class="card ${iB?"best":""}"><div class="card-row"><div class="card-img-pane">${rB}${img}${ph}</div><div class="card-body"><div><div class="store-name">${s.store}</div><div class="meta-row">${tb}${bb}${loc}${qty}${tot}</div>${s.notes?`<div class="card-notes">${s.notes}</div>`:""}</div>${lnk}</div><div class="card-price"><div class="u-price ${iB?"best":""}">${fmt(s.price_per_unit_usd)}</div><div class="per-unit">per unit</div>${pt}</div></div></div>`;
   }).join("");
   area.innerHTML=`<div class="res-bar"><span class="res-count">${list.length} store${list.length!==1?"s":""} found</span><span class="res-sort">Ranked · Price / Unit</span></div><div class="store-list">${html}</div>`;
 }
 
 // ── LOADING ───────────────────────────────────────────────────────────────────
-const STEPS=[{icon:"🔍",text:"Connecting to Google Search…"},{icon:"⚡",text:"Fetching prices (usually 2-4 sec)"},{icon:"⚖️",text:"Comparing & ranking stores"},{icon:"📊",text:"Almost done…"}];
-function startLoad(q){
+const STEPS=[
+  {icon:"🔍",text:"Searching Google for stores…"},
+  {icon:"⚡",text:"Fetching live prices…"},
+  {icon:"⚖️",text:"Comparing & ranking…"},
+  {icon:"📊",text:"Almost done…"},
+];
+
+function startLoad(q) {
   const btn=document.getElementById("searchBtn");
   btn.disabled=true;
   btn.innerHTML=`<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" style="animation:spin .8s linear infinite"><circle cx="12" cy="12" r="9"/></svg> Searching…`;
   const sh=STEPS.map((_,i)=>`<div class="lstep" id="ls${i}"><span class="li">${STEPS[i].icon}</span><span>${STEPS[i].text}</span></div>`).join("");
-  document.getElementById("res-zone").innerHTML=`<div class="loading"><div class="rings"><div class="r r1"></div><div class="r r2"></div><div class="r r3"></div></div><div class="load-title">Searching</div><div class="load-sub">Scanning stores for "${q}"…</div><div class="load-steps">${sh}</div></div>`;
-  let step=0;const el0=document.getElementById("ls0");if(el0)el0.classList.add("active");
+  document.getElementById("res-zone").innerHTML=`
+    <div class="loading">
+      <div class="rings"><div class="r r1"></div><div class="r r2"></div><div class="r r3"></div></div>
+      <div class="load-title">Searching</div>
+      <div class="load-sub">Scanning stores for "${q}"…</div>
+      <div class="load-steps">${sh}</div>
+    </div>`;
+  let step=0;
+  const el0=document.getElementById("ls0"); if(el0) el0.classList.add("active");
   stepTmr=setInterval(()=>{
     const prev=document.getElementById("ls"+step);
     if(prev){prev.classList.remove("active");prev.classList.add("done");prev.querySelector(".li").textContent="✓";}
     step=Math.min(step+1,STEPS.length-1);
-    const next=document.getElementById("ls"+step);if(next)next.classList.add("active");
-  },1500);
+    const next=document.getElementById("ls"+step); if(next) next.classList.add("active");
+  },1800);
 }
-function stopLoad(){
+
+function stopLoad() {
   clearInterval(stepTmr);
   const btn=document.getElementById("searchBtn");
   btn.disabled=false;
